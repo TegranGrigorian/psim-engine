@@ -12,7 +12,6 @@ travel time matrix is fast:
 """
 
 import datetime as dt
-import random
 
 import geopandas as gpd
 import pandas as pd
@@ -84,18 +83,15 @@ def route_totals(net, queries: pd.DataFrame, cfg: CityConfig, log=print) -> pd.D
     return out
 
 
-def route_breakdown(net, queries: pd.DataFrame, totals: pd.DataFrame, cfg: CityConfig,
-                    sample: int, seed: int, log=print) -> pd.DataFrame:
-    """Pass 2. Detailed itineraries for a seeded random sample of completed queries.
+def route_detail(net, todo: pd.DataFrame, cfg: CityConfig) -> pd.DataFrame:
+    """Pass 2 for already-chosen queries.
 
-    Each sampled query gets the single option closest to its matrix total (see
-    summarize.py), plus `breakdown_total_minutes`'s gap to that total.
+    `todo`: query_id, date, depart_time, coordinates, target_minutes (the matrix
+    total). Each query gets the single detailed option closest to its target
+    (see summarize.py). Returns one row per query_id, including queries that
+    r5py found no option for (breakdown_completed False).
     """
-    done_ids = sorted(totals[totals.completed].query_id)
-    chosen = set(random.Random(seed).sample(done_ids, min(sample, len(done_ids))))
-    todo = queries[queries.query_id.isin(chosen)]
     frames = []
-    done = 0
     for (date, depart_time), group in todo.groupby(["date", "depart_time"], sort=True):
         origins = _points(group.origin_lat, group.origin_lon, list(group.query_id))
         dests = _points(group.dest_lat, group.dest_lon, list(group.query_id))
@@ -104,16 +100,12 @@ def route_breakdown(net, queries: pd.DataFrame, totals: pd.DataFrame, cfg: CityC
             departure=_departure(date, depart_time), transport_modes=TRANSIT_MODES, **_limits(cfg),
         )
         frames.append(pd.DataFrame(itineraries.drop(columns="geometry")))
-        done += len(group)
-        if done % 25 < len(group):
-            log(f"  breakdown {done}/{len(todo)} queries")
     segments = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
         columns=["from_id", "option", "segment", "transport_mode", "departure_time", "travel_time"])
-    targets = todo.merge(totals[["query_id", "total_minutes"]], on="query_id")
     targets = pd.DataFrame({
-        "query_id": targets.query_id,
-        "departure": [_departure(d, t) for d, t in zip(targets.date, targets.depart_time)],
-        "target_minutes": targets.total_minutes,
+        "query_id": todo.query_id.values,
+        "departure": [_departure(d, t) for d, t in zip(todo.date, todo.depart_time)],
+        "target_minutes": todo.target_minutes.values,
     }).sort_values("query_id")
     out = query_outcomes(segments, targets)
     return out.rename(columns={"completed": "breakdown_completed",
