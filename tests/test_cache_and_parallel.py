@@ -9,7 +9,7 @@ from psim_engine.run import choose_sample
 def keys(*rows) -> pd.DataFrame:
     return pd.DataFrame(
         [dict(date="2026-11-10", depart_time=t, origin_lat=o, origin_lon=-83.7,
-              dest_lat=d, dest_lon=-83.6) for t, o, d in rows]
+              dest_lat=d, dest_lon=-83.6, due_time="") for t, o, d in rows]
     )
 
 
@@ -55,7 +55,8 @@ def test_breakdown_for_only_returns_queries_that_have_one(tmp_path):
     k = keys(("08:00", 42.1, 42.2), ("09:00", 42.1, 42.2))
     cache.add_breakdown(k.iloc[:1].assign(
         breakdown_completed=True, breakdown_total_minutes=21.0, wait_minutes=5.0,
-        in_vehicle_minutes=10.0, walk_minutes=6.0, transfers=0))
+        in_vehicle_minutes=10.0, walk_minutes=6.0, transfers=0,
+        planned_departure=None, scheduled_minutes=None, p_on_time=None, delay_p95_minutes=None))
     got = cache.breakdown_for(k.assign(query_id=["q1", "q2"]))
     assert list(got.query_id) == ["q1"]
 
