@@ -5,6 +5,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from .reliability import Reliability
+
 
 @dataclass(frozen=True)
 class CityConfig:
@@ -18,6 +20,7 @@ class CityConfig:
     max_trip_minutes: int
     osm: Path
     gtfs: dict[str, list[Path]]  # scenario -> feed folders
+    reliability: Reliability | None = None  # delay model; None = timetable only
 
     @classmethod
     def load(cls, data_dir: Path, city: str) -> "CityConfig":
@@ -34,6 +37,7 @@ class CityConfig:
             max_trip_minutes=raw["max_trip_minutes"],
             osm=city_dir / raw["osm"],
             gtfs={name: [city_dir / f for f in folders] for name, folders in raw["gtfs"].items()},
+            reliability=Reliability.from_json(raw["reliability"]) if raw.get("reliability") else None,
         )
 
     def date_for_day(self, day: str) -> dt.date:
