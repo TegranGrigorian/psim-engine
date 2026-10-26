@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .cache import QueryCache, normalize_keys
+from .cache import BREAKDOWN_COLUMNS, QueryCache, normalize_keys
 from .config import CityConfig
 from .parallel import Pool, _detail_task, _totals_task
 from .queries import QUERY_KEY, build_queries
@@ -16,7 +16,9 @@ from .queries import QUERY_KEY, build_queries
 RESULT_COLUMNS = [
     "run_id", "trip_id", "persona_id", "completed", "walk_only", "total_minutes",
     "wait_minutes", "in_vehicle_minutes", "walk_minutes", "transfers",
-    "breakdown_total_minutes", "breakdown_sampled", "routing_percentile", "failure_reason",
+    "breakdown_total_minutes", "breakdown_sampled",
+    "planned_departure", "scheduled_minutes", "p_on_time", "delay_p95_minutes",
+    "routing_percentile", "failure_reason",
 ]
 
 
@@ -25,10 +27,14 @@ def assemble_results(run_id: str, trips: pd.DataFrame, trip_query: pd.Series,
     """Copies per-query outcomes back onto every trip (pure pandas, no JVM)."""
     df = trips[["trip_id", "persona_id"]].assign(query_id=trip_query)
     df = df.merge(totals, on="query_id", how="left", validate="many_to_one")
-    cols = ["breakdown_total_minutes", "wait_minutes", "in_vehicle_minutes", "walk_minutes", "transfers"]
-    detail = breakdown[breakdown.breakdown_completed.fillna(False).astype(bool)][["query_id", *cols]]
-    df = df.merge(detail, on="query_id", how="left", validate="many_to_one")
-    df["breakdown_sampled"] = df.query_id.isin(set(detail.query_id))
+    cols = ["breakdown_total_minutes", "wait_minutes", "in_vehicle_minutes", "walk_minutes", "transfers",
+            "planned_departure", "scheduled_minutes", "p_on_time", "delay_p95_minutes"]
+    # Every sampled query keeps its row, because a trip that could not be planned to arrive on
+    # time has no breakdown but is still a late trip (p_on_time = 0), and dropping it would
+    # flatter the on-time rate. `breakdown_sampled` marks only those with a breakdown.
+    df = df.merge(breakdown[["query_id", *cols]], on="query_id", how="left", validate="many_to_one")
+    done = breakdown[breakdown.breakdown_completed.fillna(False).astype(bool)]
+    df["breakdown_sampled"] = df.query_id.isin(set(done.query_id))
     df["run_id"] = run_id
     df["routing_percentile"] = 50
     # r5py does not say *why* nothing was found, so every failure is `no_route`.
@@ -56,7 +62,7 @@ def find_runs(cfg: CityConfig, scenario: str) -> list[str]:
 def _load_run(cfg: CityConfig, run_id: str, limit: int | None) -> LoadedRun:
     run_dir = cfg.city_dir / "generated" / run_id
     manifest = json.loads((run_dir / "manifest.json").read_text())
-    trips = pd.read_csv(run_dir / "trips.csv", dtype={"depart_time": str})
+    trips = pd.read_csv(run_dir / "trips.csv", dtype={"depart_time": str, "due_time": str})
     if limit:
         trips = trips.head(limit)
     queries, trip_query = build_queries(trips, cfg)
@@ -116,9 +122,7 @@ def _route_scenario(cfg, scenario, runs, breakdown_sample, workers, memory, log)
             todo = todo.rename(columns={"total_minutes": "target_minutes"})
             todo["query_id"] = [f"d{i:07d}" for i in range(len(todo))]
             detail = get_pool().map(_detail_task, todo, "detail", log)
-            cache.add_breakdown(todo.merge(detail, on="query_id")[QUERY_KEY + [
-                "breakdown_completed", "breakdown_total_minutes", "wait_minutes",
-                "in_vehicle_minutes", "walk_minutes", "transfers"]])
+            cache.add_breakdown(todo.merge(detail, on="query_id")[QUERY_KEY + BREAKDOWN_COLUMNS])
             cache.save()
             log(f"  detail in {time.time() - t0:.1f}s")
     finally:
