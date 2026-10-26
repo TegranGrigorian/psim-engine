@@ -12,13 +12,18 @@ travel time matrix is fast:
 """
 
 import datetime as dt
+import json
+import zlib
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import r5py
 from shapely.geometry import Point
 
 from .config import CityConfig
+from .planning import latest_departure
+from .reliability import Leg, Schedule, simulate_delays, summarize_delays
 from .summarize import query_outcomes
 
 TRANSIT_MODES = [r5py.TransportMode.TRANSIT, r5py.TransportMode.WALK]
@@ -83,14 +88,22 @@ def route_totals(net, queries: pd.DataFrame, cfg: CityConfig, log=print) -> pd.D
     return out
 
 
-def route_detail(net, todo: pd.DataFrame, cfg: CityConfig) -> pd.DataFrame:
-    """Pass 2 for already-chosen queries.
+PLAN_COLUMNS = ["planned_departure", "scheduled_minutes", "p_on_time", "delay_p95_minutes"]
 
-    `todo`: query_id, date, depart_time, coordinates, target_minutes (the matrix
-    total). Each query gets the single detailed option closest to its target
-    (see summarize.py). Returns one row per query_id, including queries that
-    r5py found no option for (breakdown_completed False).
-    """
+_SCHEDULES: dict[tuple[str, str], Schedule] = {}
+
+
+def _schedule(cfg: CityConfig, feed: str, date: str) -> Schedule:
+    """Timetable of one feed on one date, built once per worker (cleaned feed zips)."""
+    key = (feed, date)
+    if key not in _SCHEDULES:
+        zip_path = cfg.city_dir / "raw" / "gtfs_clean" / f"{feed}.zip"
+        _SCHEDULES[key] = Schedule.from_gtfs(zip_path, dt.date.fromisoformat(date))
+    return _SCHEDULES[key]
+
+
+def _detail_plain(net, todo: pd.DataFrame, cfg: CityConfig) -> pd.DataFrame:
+    """Detailed itinerary closest to each query's matrix total, leaving at its nominal time."""
     frames = []
     for (date, depart_time), group in todo.groupby(["date", "depart_time"], sort=True):
         origins = _points(group.origin_lat, group.origin_lon, list(group.query_id))
@@ -108,5 +121,101 @@ def route_detail(net, todo: pd.DataFrame, cfg: CityConfig) -> pd.DataFrame:
         "target_minutes": todo.target_minutes.values,
     }).sort_values("query_id")
     out = query_outcomes(segments, targets)
-    return out.rename(columns={"completed": "breakdown_completed",
-                               "total_minutes": "breakdown_total_minutes"})
+    out = out.rename(columns={"completed": "breakdown_completed", "total_minutes": "breakdown_total_minutes"})
+    for c in PLAN_COLUMNS:
+        out[c] = None
+    return out
+
+
+def _hhmm(minutes: float) -> str:
+    return f"{int(minutes // 60) % 24:02d}:{int(minutes % 60):02d}"
+
+
+def _pair_minutes(net, row, departure: dt.datetime, cfg: CityConfig) -> float | None:
+    """Door-to-door minutes when leaving exactly at `departure` (a one-minute window)."""
+    matrix = r5py.TravelTimeMatrix(
+        net,
+        origins=_points(pd.Series([row.origin_lat]), pd.Series([row.origin_lon]), ["o"]),
+        destinations=_points(pd.Series([row.dest_lat]), pd.Series([row.dest_lon]), ["d"]),
+        departure=departure, percentiles=[50], transport_modes=TRANSIT_MODES,
+        **{**_limits(cfg), "departure_time_window": dt.timedelta(minutes=1)},
+    )
+    col = "travel_time" if "travel_time" in matrix.columns else matrix.columns[-1]
+    value = matrix[col].iloc[0]
+    return None if pd.isna(value) else float(value)
+
+
+def _failed_plan(query_id: str, planned: str | None = None) -> dict:
+    return {"query_id": query_id, "breakdown_completed": False, "breakdown_total_minutes": None,
+            "wait_minutes": None, "in_vehicle_minutes": None, "walk_minutes": None, "transfers": None,
+            "planned_departure": planned, "scheduled_minutes": None,
+            # a trip that cannot be planned to arrive in time is not on time
+            "p_on_time": 0.0, "delay_p95_minutes": None}
+
+
+def _plan_one(net, row, cfg: CityConfig) -> dict:
+    """Plan arrive-by, route the planned departure in detail, and simulate delays."""
+    rel = cfg.reliability
+    date = dt.date.fromisoformat(row.date)
+    midnight = dt.datetime(date.year, date.month, date.day)
+    h, m = row.due_time.split(":")
+    due = int(h) * 60 + int(m)
+
+    plan = latest_departure(
+        lambda d: _pair_minutes(net, row, midnight + dt.timedelta(minutes=d), cfg),
+        due_minute=due, margin=rel.arrive_margin_minutes,
+    )
+    if plan is None:
+        return _failed_plan(row.query_id)
+    depart, scheduled = plan
+    departure = midnight + dt.timedelta(minutes=depart)
+
+    itineraries = r5py.DetailedItineraries(
+        net,
+        origins=_points(pd.Series([row.origin_lat]), pd.Series([row.origin_lon]), [row.query_id]),
+        destinations=_points(pd.Series([row.dest_lat]), pd.Series([row.dest_lon]), [row.query_id]),
+        departure=departure, transport_modes=TRANSIT_MODES,
+        **{**_limits(cfg), "departure_time_window": dt.timedelta(minutes=1)},
+    )
+    segments = pd.DataFrame(itineraries.drop(columns="geometry"))
+    targets = pd.DataFrame({"query_id": [row.query_id], "departure": [pd.Timestamp(departure)],
+                            "target_minutes": [scheduled]})
+    out = query_outcomes(segments, targets, with_legs=True).iloc[0]
+    if not out.completed:
+        return _failed_plan(row.query_id, _hhmm(depart))
+
+    legs = [Leg(**leg) for leg in json.loads(out.legs_json)]
+    schedules = {leg.feed: _schedule(cfg, leg.feed, row.date) for leg in legs}
+    arrival = depart + out.total_minutes  # minutes after midnight, scheduled
+    slack = max(0.0, (due - rel.arrive_margin_minutes) - arrival)
+    seed = zlib.crc32(f"{row.date}|{row.due_time}|{row.origin_lat}|{row.origin_lon}|{row.dest_lat}|{row.dest_lon}".encode())
+    delays = simulate_delays(legs, schedules, rel, np.random.default_rng(seed))
+    p_on_time, p95 = summarize_delays(delays, slack, rel)
+    return {
+        "query_id": row.query_id, "breakdown_completed": True, "breakdown_total_minutes": out.total_minutes,
+        "wait_minutes": out.wait_minutes, "in_vehicle_minutes": out.in_vehicle_minutes,
+        "walk_minutes": out.walk_minutes, "transfers": out.transfers,
+        "planned_departure": _hhmm(depart), "scheduled_minutes": scheduled,
+        "p_on_time": p_on_time, "delay_p95_minutes": p95,
+    }
+
+
+def route_detail(net, todo: pd.DataFrame, cfg: CityConfig) -> pd.DataFrame:
+    """Pass 2 for already-chosen queries.
+
+    `todo`: query_id, date, depart_time, coordinates, due_time, target_minutes (the matrix
+    total). Queries with a start time (`due_time`) are planned: the rider leaves as late as
+    the timetable allows and still arrives on time, and the delay model (when the config has
+    one) says how often that plan fails. The others leave at their nominal time and get the
+    single detailed option closest to the matrix total (see summarize.py). Returns one row per
+    query_id, including queries r5py found no option for (breakdown_completed False).
+    """
+    planned_mask = (todo.due_time != "") & (cfg.reliability is not None)
+    parts = []
+    if (~planned_mask).any():
+        parts.append(_detail_plain(net, todo[~planned_mask], cfg))
+    for row in todo[planned_mask].itertuples(index=False):
+        parts.append(pd.DataFrame([_plan_one(net, row, cfg)]))
+    out = pd.concat(parts, ignore_index=True)
+    out["transfers"] = out["transfers"].astype("Int64")
+    return out
