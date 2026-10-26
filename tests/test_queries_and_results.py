@@ -51,6 +51,7 @@ def test_results_copy_outcomes_to_every_trip_and_flag_failures():
         "query_id": [queries.query_id[0]], "breakdown_completed": [True],
         "breakdown_total_minutes": [31.0], "wait_minutes": [6.0], "in_vehicle_minutes": [14.0],
         "walk_minutes": [10.0], "transfers": [1],
+        "planned_departure": ["08:01"], "scheduled_minutes": [29.0], "p_on_time": [0.4], "delay_p95_minutes": [12.5],
     })
     res = assemble_results("baseline_s0042", t, trip_query, totals, breakdown)
     assert list(res.columns) == RESULT_COLUMNS
@@ -70,3 +71,39 @@ def test_results_copy_outcomes_to_every_trip_and_flag_failures():
     assert r.loc["t4", "walk_only"] and r.loc["t4", "total_minutes"] == 9.0
     assert pd.isna(r.loc["t4", "wait_minutes"]) and not r.loc["t4", "breakdown_sampled"]
     assert (res.routing_percentile == 50).all()
+    # the planning and delay-model columns travel with the breakdown
+    assert r.loc["t1", "planned_departure"] == "08:01" and r.loc["t1", "p_on_time"] == 0.4
+    assert r.loc["t2", "delay_p95_minutes"] == 12.5 and pd.isna(r.loc["t4", "p_on_time"])
+
+
+def test_a_trip_that_cannot_be_planned_keeps_its_zero_on_time_probability():
+    t = trips()
+    queries, trip_query = build_queries(t, cfg())
+    totals = pd.DataFrame({"query_id": queries.query_id, "completed": [True, True, True],
+                           "walk_only": [False] * 3, "total_minutes": [30.0, 25.0, 20.0]})
+    # q000001 (the saturday trip) was sampled but no plan could arrive in time
+    breakdown = pd.DataFrame({
+        "query_id": [queries.query_id[1]], "breakdown_completed": [False],
+        "breakdown_total_minutes": [None], "wait_minutes": [None], "in_vehicle_minutes": [None],
+        "walk_minutes": [None], "transfers": [None], "planned_departure": [None],
+        "scheduled_minutes": [None], "p_on_time": [0.0], "delay_p95_minutes": [None],
+    })
+    res = assemble_results("r", t, trip_query, totals, breakdown).set_index("trip_id")
+    assert res.loc["t3", "p_on_time"] == 0.0
+    assert not res.loc["t3", "breakdown_sampled"], "no breakdown, so not counted in the breakdown means"
+    assert pd.isna(res.loc["t1", "p_on_time"])
+
+
+def test_a_start_time_makes_a_different_query_from_a_nominal_departure():
+    t = trips()
+    t["due_time"] = ["09:00", "09:00", "", "09:00"]  # t1 and t2 share a plan; t3 has none; t4 differs in time
+    queries, trip_query = build_queries(t, cfg())
+    q = list(trip_query)
+    assert q[0] == q[1]
+    assert len(set(q)) == 3
+    assert set(queries.due_time) == {"09:00", ""}
+
+
+def test_trips_without_a_due_time_column_still_work():
+    queries, _ = build_queries(trips(), cfg())
+    assert set(queries.due_time) == {""}
