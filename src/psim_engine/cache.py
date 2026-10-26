@@ -17,12 +17,14 @@ from .config import CityConfig
 from .queries import QUERY_KEY
 
 # Bump when the routing method changes in a way that changes results.
-METHOD_VERSION = "1"
+METHOD_VERSION = "2"
 
 TOTALS_COLUMNS = ["completed", "walk_only", "total_minutes"]
 BREAKDOWN_COLUMNS = [
     "breakdown_completed", "breakdown_total_minutes", "wait_minutes",
     "in_vehicle_minutes", "walk_minutes", "transfers",
+    # planned required trips only: when the rider leaves, the timetable travel time, and the delay model's output
+    "planned_departure", "scheduled_minutes", "p_on_time", "delay_p95_minutes",
 ]
 
 
@@ -33,6 +35,7 @@ def normalize_keys(df: pd.DataFrame) -> pd.DataFrame:
         out[col] = out[col].astype(float).round(6)
     out["date"] = out["date"].astype(str)
     out["depart_time"] = out["depart_time"].astype(str)
+    out["due_time"] = out["due_time"].fillna("").astype(str)
     return out
 
 
