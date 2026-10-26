@@ -20,6 +20,8 @@ For each option:
 - transfers: transit segments - 1.
 """
 
+import json
+
 import pandas as pd
 
 OUTCOME_COLUMNS = [
@@ -74,13 +76,43 @@ def option_metrics(segments: pd.DataFrame, departures: pd.Series) -> pd.DataFram
     return out.drop(columns=["n_transit", "start", "end", "sum_minutes"])
 
 
+def option_legs(option_segments: pd.DataFrame, day_start: pd.Timestamp) -> list[dict]:
+    """The bus rides of one itinerary, with times in minutes after `day_start`.
+
+    For each non-walking segment: the feed, route and boarding stop, when the rider planned to
+    reach the stop (the end of the previous segment), when the bus departs, and when the ride
+    ends.
+    """
+    seg = option_segments.sort_values("segment")
+    minutes = lambda ts: (ts - day_start).total_seconds() / 60.0
+    legs: list[dict] = []
+    previous_end = None
+    for row in seg.itertuples(index=False):
+        start = row.departure_time
+        walking = str(row.transport_mode).upper().endswith("WALK")
+        if not walking and pd.notna(start):
+            board = minutes(start)
+            legs.append({
+                "feed": str(getattr(row, "feed", "")),
+                "route_id": str(getattr(row, "route_id", "")),
+                "stop_id": str(getattr(row, "start_stop_id", "")),
+                "reach_stop": minutes(previous_end) if previous_end is not None else board,
+                "board": board,
+                "alight": minutes(start + row.travel_time),
+            })
+        if pd.notna(start):
+            previous_end = start + row.travel_time
+    return legs
+
+
 def query_outcomes(
-    segments: pd.DataFrame, targets: pd.DataFrame
+    segments: pd.DataFrame, targets: pd.DataFrame, with_legs: bool = False
 ) -> pd.DataFrame:
     """The representative option for each query in `targets`.
 
     `targets`: query_id, departure (Timestamp), target_minutes (the matrix total).
-    Queries with no option come back with completed=False.
+    Queries with no option come back with completed=False. With `with_legs`, a `legs_json`
+    column holds the chosen option's bus rides (see `option_legs`).
     """
     cols = ["total_minutes", "wait_minutes", "in_vehicle_minutes", "walk_minutes", "transfers"]
     chosen: dict[str, dict] = {}
@@ -91,8 +123,13 @@ def query_outcomes(
         opts["gap"] = (opts["total_minutes"] - opts["from_id"].map(goal)).abs()
         # lowest gap, then lowest option number, so the choice is deterministic
         best = opts.sort_values(["from_id", "gap", "option"]).groupby("from_id", sort=False).head(1)
+        by_option = {k: g for k, g in segments.groupby(["from_id", "option"])} if with_legs else {}
         for row in best.itertuples(index=False):
             chosen[str(row.from_id)] = {c: float(getattr(row, c)) for c in cols}
+            if with_legs:
+                day = departures[row.from_id].normalize()
+                chosen[str(row.from_id)]["legs_json"] = json.dumps(
+                    option_legs(by_option[(row.from_id, row.option)], day))
     rows = []
     for qid in targets["query_id"]:
         r = chosen.get(qid)
@@ -102,5 +139,7 @@ def query_outcomes(
     for c in OUTCOME_COLUMNS:
         if c not in df.columns:
             df[c] = pd.NA
+    if with_legs and "legs_json" not in df.columns:
+        df["legs_json"] = None
     df["transfers"] = df["transfers"].astype("Int64")
-    return df[OUTCOME_COLUMNS]
+    return df[OUTCOME_COLUMNS + (["legs_json"] if with_legs else [])]
