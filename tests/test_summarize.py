@@ -88,3 +88,35 @@ def test_empty_results_are_all_not_completed():
     empty = pd.DataFrame([seg("x", 0, 0, "WALK", 0, 1)]).iloc[0:0]
     out = query_outcomes(empty, targets(a=10.0, b=12.0))
     assert list(out.completed) == [False, False]
+
+
+def seg2(option, segment, mode, start_min, minutes, route=None, stop=None, feed=None):
+    return {**seg("q", option, segment, mode, start_min, minutes), "feed": feed, "route_id": route, "start_stop_id": stop}
+
+
+def test_legs_list_each_bus_ride_with_when_the_rider_reaches_the_stop():
+    df = pd.DataFrame([
+        seg2(1, 0, "WALK", 1, 4),                              # 08:01-08:05, reaches the stop at 08:05
+        seg2(1, 1, "BUS", 10, 12, route="R1", stop="S1", feed="f1"),   # departs 08:10, ride ends 08:22
+        seg2(1, 2, "WALK", 23, 3),                             # transfer walk 08:23-08:26
+        seg2(1, 3, "BUS", 30, 20, route="R2", stop="S2", feed="f2"),   # departs 08:30, ends 08:50
+        seg2(1, 4, "WALK", 51, 2),
+    ])
+    targets = pd.DataFrame({"query_id": ["q"], "departure": [T0], "target_minutes": [53.0]})
+    out = query_outcomes(df, targets, with_legs=True).iloc[0]
+    import json
+    legs = json.loads(out.legs_json)
+    day = T0.normalize()
+    base = (T0 - day).total_seconds() / 60  # 480
+    assert [l["route_id"] for l in legs] == ["R1", "R2"]
+    assert legs[0] == {"feed": "f1", "route_id": "R1", "stop_id": "S1", "reach_stop": base + 5, "board": base + 10, "alight": base + 22}
+    assert legs[1]["reach_stop"] == base + 26, "the transfer walk ends at 08:26"
+    assert legs[1]["board"] - legs[1]["reach_stop"] == 4, "four minutes of planned slack for the transfer"
+
+
+def test_a_walk_has_no_legs_and_without_with_legs_there_is_no_column():
+    df = pd.DataFrame([seg2(0, 0, "WALK", None, 9.5)])
+    targets = pd.DataFrame({"query_id": ["q"], "departure": [T0], "target_minutes": [9.5]})
+    import json
+    assert json.loads(query_outcomes(df, targets, with_legs=True).iloc[0].legs_json) == []
+    assert "legs_json" not in query_outcomes(df, targets).columns
